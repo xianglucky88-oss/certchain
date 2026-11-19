@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+from datetime import datetime, timezone
 
 from lxml import html as _lh
 
+from . import events, timeutil
 from .config import SPEC
 from .store import Store
 
@@ -115,22 +117,59 @@ def parse(resp_body, fmt):
     raise ValueError("unknown fmt: %s" % fmt)
 
 
-def fetch_all(http: Http):
-    """Collect records from the local source."""
+def fetch_batch(http: Http):
+    """Collect records page by page, tolerating an interruption.
+
+    A page that cannot be retrieved after the configured retries does **not**
+    raise and is **not** turned into a domain event: the pages already obtained
+    are returned, together with ``complete=False`` and a description of the
+    interruption.  Callers must not advance their incremental watermark past a
+    gap, so a later successful run re-reads the same window.  Source
+    availability itself is still governed by :class:`Http`'s retry policy.
+    """
+    max_pages = int(getattr(SPEC, "max_pages", 200))
     records, attempts, page = [], 0, 1
+    completion = {"complete": True, "pages": 0, "error": None,
+                  "interrupted_page": None}
     while True:
-        status, _hdr, body, att = http.get("/" + SPEC.endpoint, params={"page": page})
-        attempts += att + 1
-        if status != 200:
-            raise RuntimeError("fetch failed status=%s page=%s" % (status, page))
-        page_recs = parse(body, SPEC.fmt)
+        try:
+            status, _hdr, body, att = http.get(
+                "/" + SPEC.endpoint, params={"page": page})
+            attempts += att + 1
+            if status != 200:
+                raise RuntimeError("status=%s" % status)
+            page_recs = parse(body, SPEC.fmt)
+        except Exception as exc:  # transport exhausted or malformed response
+            completion.update({"complete": False,
+                               "interrupted_page": page,
+                               "error": "%s: %s" % (type(exc).__name__, exc)})
+            break
         records.extend(page_recs)
+        completion["pages"] = page
         if len(page_recs) < SPEC.page_size:
             break
         page += 1
-        if page > 200:
+        if page > max_pages:
+            completion.update({"complete": False,
+                               "interrupted_page": page,
+                               "error": "page limit %d reached" % max_pages})
             break
+    return records, attempts, completion
+
+
+def fetch_all(http: Http):
+    """Collect records from the local source, raising on an incomplete read.
+
+    Retained for backward compatibility: callers that treat any interrupted
+    page as a hard failure get the original ``RuntimeError``.  The pipeline
+    itself uses :func:`fetch_batch`, which preserves the pages already read.
+    """
+    records, attempts, completion = fetch_batch(http)
+    if not completion["complete"]:
+        raise RuntimeError("fetch failed status=%s page=%s"
+                           % (completion.get("error"), completion.get("interrupted_page")))
     return records, attempts
+
 
 
 # --------------------------------------------------------------------------- #
@@ -176,31 +215,71 @@ def _apply_kernel(records):
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
-def run(mode="full", con=None):
+def _ingest_events(store, records, run_id, source, now_us):
+    """Append observations to the event log.
+
+    Returns ``(inserted, updated)`` counts.  In incremental mode the record view
+    is filtered by the watermark, but *every* fetched row is still offered to
+    the event log: an event that arrives late is exactly what the log must
+    keep, and the event id makes the operation idempotent.
+    """
+    inserted = updated = 0
+    seen = set()
+    for record in records:
+        event = events.build_event(record, run_id=run_id, source=source,
+                                   now_us=now_us)
+        if event["event_id"] in seen:
+            continue  # an intra-batch repeat is one observation, not two
+        seen.add(event["event_id"])
+        if store.append_event(event) == "inserted":
+            inserted += 1
+        else:
+            updated += 1
+    return inserted, updated
+
+
+def run(mode="full", con=None, now=None, run_id=""):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
+    now_us = timeutil.epoch_us(now)
+    if now_us is None:
+        now_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+    run_id = run_id or "run-%d" % now_us
     try:
-        records, attempts = fetch_all(http)
+        records, attempts, completion = fetch_batch(http)
         norm = [normalize(dict(r)) for r in records]
         norm, dup_in_batch = dedup(norm)
         norm = _apply_kernel(norm)
 
         wm = store.watermark()
+        touched = norm
         if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
+            touched = [r for r in norm if str(r.get("ts", "")) > wm]
 
-        ingested = sum(1 for r in norm if store.upsert(r))
+        ingested = sum(1 for r in touched if store.upsert(r))
+        ev_inserted, ev_updated = _ingest_events(
+            store, records, run_id, SPEC.endpoint, now_us)
         total = store.count()
-        new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
-        if new_wm:
-            store.set_watermark(new_wm)
+
+        # Only advance the watermark over a complete read: a gap means later
+        # pages might hold events we have not seen yet.
+        if completion["complete"]:
+            new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
+            if new_wm:
+                store.set_watermark(new_wm)
+
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(),
+                "events_inserted": ev_inserted, "events_updated": ev_updated,
+                "events_total": store.event_count(),
+                "partial": not completion["complete"],
+                "interrupted_page": completion.get("interrupted_page"),
+                "fetch_error": completion.get("error")}
     finally:
         if own:
             con.close()
@@ -235,23 +314,36 @@ class Rpa:
         return json.loads(body)
 
     def collect(self):
-        out, page = [], 1
+        """Collect query pages, resuming past a captcha interruption.
+
+        The gate is a session challenge, not a business event, so it never
+        produces a status observation.  Pages are tracked by number: a page is
+        consumed exactly once even if the portal asks us to repeat the request
+        after solving the challenge, and no page is skipped.
+        """
+        pages, page = {}, 1
+        max_pages = int(getattr(SPEC, "max_pages", 200))
         while True:
             self.sleeper.sleep(0.1)
             data = self._query_page(page)
-            out.extend(data.get("items", []))
+            if page not in pages:
+                pages[page] = data.get("items", [])
             if data.get("captcha_required") and not self.captcha_solved:
                 ok = self._solve_captcha()
                 if not ok:
                     raise RuntimeError("captcha solve rejected")
                 self.captcha_solved = True
-                page += 1
+                # Repeat the same page; it was not consumed, so nothing is lost
+                # and nothing is counted twice.
                 continue
             if not data.get("has_more"):
                 break
             page += 1
-            if page > 200:
+            if page > max_pages:
                 break
+        out = []
+        for number in sorted(pages):
+            out.extend(pages[number])
         self.log.append("collect:%d" % len(out))
         return out
 
@@ -273,11 +365,15 @@ class Rpa:
         return bool(data.get("created"))
 
 
-def run_rpa(con=None):
+def run_rpa(con=None, now=None, run_id=""):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
     r = Rpa()
+    now_us = timeutil.epoch_us(now)
+    if now_us is None:
+        now_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+    run_id = run_id or "rpa-%d" % now_us
     try:
         logged = r.login()
         items = r.collect()
@@ -285,6 +381,8 @@ def run_rpa(con=None):
         norm, dup = dedup(norm)
         norm = _apply_kernel(norm)
         ingested = sum(1 for x in norm if store.upsert(x))
+        ev_inserted, ev_updated = _ingest_events(
+            store, items, run_id, "query", now_us)
         total = store.count()
         created = dedup_submit = 0
         for x in norm[:2]:
@@ -301,7 +399,10 @@ def run_rpa(con=None):
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
+                "events_inserted": ev_inserted, "events_updated": ev_updated,
+                "events_total": store.event_count(),
                 "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
     finally:
         if own:
             con.close()
+

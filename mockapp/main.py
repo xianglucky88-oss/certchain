@@ -12,6 +12,9 @@ _ALL = build_rows()
 _extra = []
 _verified_sessions = set()
 _accepted_tokens = set()
+# Test hooks: pages that should fail, and rows to deliver late.
+_fault_pages = {}          # page -> remaining failure count
+_fault_status = 500
 
 def _data():
     return _ALL + _extra
@@ -22,6 +25,10 @@ def _page_items(page):
 
 @app.get("/items")
 def items(page: int = 1):
+    remaining = _fault_pages.get(page, 0)
+    if remaining > 0:
+        _fault_pages[page] = remaining - 1
+        return Response(status_code=_fault_status)
     data = _page_items(page)
     if SPEC.fmt == "json":
         return {"items": data, "page": page}
@@ -33,6 +40,40 @@ def items(page: int = 1):
                   + "</tr>" for it in data)
     return Response(content="<html><table><tr>%s</tr>%s</table></html>" % (th, trs),
                     media_type="text/html")
+
+@app.post("/admin/fault")
+async def fault(request: Request):
+    """Enable a transient failure for a page (offline test hook)."""
+    body = await request.json()
+    page = int(body.get("page", 1))
+    global _fault_status
+    _fault_status = int(body.get("status", 500))
+    count = int(body.get("count", 1))
+    if count > 0:
+        _fault_pages[page] = count
+    else:
+        _fault_pages.pop(page, None)
+    return {"page": page, "count": max(count, 0), "status": _fault_status}
+
+@app.post("/admin/append")
+async def append(request: Request):
+    """Insert a source row (offline test hook for late events)."""
+    body = await request.json()
+    row = dict(body.get("row") or body)
+    position = body.get("position")
+    if position is None:
+        _extra.append(row)
+    else:
+        _extra.insert(int(position), row)
+    return {"total": len(_data())}
+
+@app.post("/admin/reset")
+def reset():
+    _extra.clear()
+    _fault_pages.clear()
+    _verified_sessions.clear()
+    _accepted_tokens.clear()
+    return {"total": len(_data())}
 
 @app.get("/refresh")
 def refresh():

@@ -3,6 +3,8 @@ run:
 	PYTHONPATH=src:. $(PY) -m certchain.cli
 run_inc:
 	PYTHONPATH=src:. $(PY) -m certchain.cli --incremental
+status:
+	PYTHONPATH=src:. $(PY) -m certchain.cli --list --text
 test:
 	PYTHONPATH=src:. $(PY) -m pytest -q
 mock:
